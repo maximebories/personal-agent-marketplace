@@ -35,7 +35,7 @@ To copy a skill into your current repository workspace's local agent folder:
 
 ```bash
 # 1. Download/clone the marketplace source to a temporary folder
-git clone --depth 1 https://github.com/your-username/personal-agent-marketplace.git /tmp/marketplace
+git clone --depth 1 https://github.com/maximebories/personal-agent-marketplace.git /tmp/marketplace
 
 # 2. Ensure target local skills directory exists
 mkdir -p .agents/skills/
