@@ -12,6 +12,7 @@ import json
 import os
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import tarfile
@@ -176,6 +177,65 @@ def download_file(url: str, dest: Path):
         print(f"\nDownload failed: {e}", file=sys.stderr)
         raise
 
+def extract_asar_member(asar_path: Path, member: str):
+    """Reads a single file out of an Electron .asar archive using only stdlib.
+
+    An asar is two nested Chromium pickles: an 8-byte size prefix, a JSON
+    directory tree, then all file bytes concatenated. Returns the member's
+    bytes, or None if it is absent.
+    """
+    with open(asar_path, "rb") as f:
+        head = f.read(16)
+        if len(head) < 16:
+            return None
+        # [0:4] outer payload size, [4:8] header pickle length,
+        # [8:12] header payload length, [12:16] JSON string length
+        size_field = struct.unpack("<I", head[4:8])[0]
+        json_len = struct.unpack("<I", head[12:16])[0]
+        try:
+            header = json.loads(f.read(json_len).decode("utf-8"))
+        except Exception:
+            return None
+        data_offset = 8 + size_field  # start of the file-data region
+
+        node = header
+        for part in member.strip("/").split("/"):
+            files = node.get("files") if isinstance(node, dict) else None
+            if not files or part not in files:
+                return None
+            node = files[part]
+
+        if node.get("unpacked"):
+            # Large/excluded files live on disk in <archive>.unpacked/
+            unpacked = asar_path.with_name(asar_path.name + ".unpacked")
+            ext = unpacked.joinpath(*member.strip("/").split("/"))
+            return ext.read_bytes() if ext.exists() else None
+
+        f.seek(data_offset + int(node["offset"]))
+        return f.read(int(node["size"]))
+
+def write_launcher_icon(target_dir: Path):
+    """Places icon.png in target_dir, sourcing it from disk or from app.asar."""
+    icon_dest = target_dir / "icon.png"
+    disk_candidates = [
+        target_dir / "resources" / "app" / "resources" / "linux" / "code.png",
+        target_dir / "resources" / "linux" / "code.png",
+    ]
+    for cand in disk_candidates:
+        if cand.exists():
+            shutil.copy(str(cand), str(icon_dest))
+            return
+    # Newer builds ship the icon only inside resources/app.asar
+    asar_path = target_dir / "resources" / "app.asar"
+    if asar_path.exists():
+        for member in ("icon.png", "resources/linux/code.png"):
+            data = extract_asar_member(asar_path, member)
+            if data:
+                icon_dest.write_bytes(data)
+                return
+    print("Warning: could not locate an application icon; the desktop "
+          "entry icon may not display.", file=sys.stderr)
+
 def setup_launchers(target_dir: Path, bin_dir: Path):
     """Ensures the wrapper script in bin_dir and the desktop file in local applications exist."""
     bin_dir.mkdir(parents=True, exist_ok=True)
@@ -278,7 +338,9 @@ def main():
         print("Extracting package...")
         try:
             with tarfile.open(tar_path, "r:gz") as tar:
-                tar.extractall(path=tmp_dir_path)
+                # filter="data" is the safe extraction policy (Python 3.12+
+                # default in 3.14); avoids the unfiltered-extract deprecation.
+                tar.extractall(path=tmp_dir_path, filter="data")
         except Exception as e:
             print(f"Extraction failed: {e}", file=sys.stderr)
             sys.exit(1)
@@ -317,15 +379,9 @@ def main():
                 # Electron's chrome-sandbox requires setuid or root permissions, or 755
                 (target_dir / "chrome-sandbox").chmod(0o4755)
                 
-            # If there was a custom icon we need to restore, or copy the new logo
-            # The app package contains a logo at resources/app/resources/linux/code.png or resources/linux/code.png
-            icon_source = target_dir / "resources" / "app" / "resources" / "linux" / "code.png"
-            if not icon_source.exists():
-                # fallback check
-                icon_source = target_dir / "resources" / "linux" / "code.png"
-            if icon_source.exists():
-                shutil.copy(str(icon_source), str(target_dir / "icon.png"))
-                
+            # Restore the launcher icon (from disk, or extracted from app.asar)
+            write_launcher_icon(target_dir)
+
             print("Setting up system launchers and shortcuts...")
             setup_launchers(target_dir, bin_dir)
             
